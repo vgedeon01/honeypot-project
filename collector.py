@@ -104,6 +104,90 @@ def insert_event(event):
 
     return True
 
+def ensure_session(event):
+    """Create a session record if it does not already exist."""
+
+    session_id = event.get("session")
+
+    if not session_id:
+        return
+
+    conn = get_connection()
+
+    cursor = conn.execute("""
+        SELECT 1
+        FROM sessions
+        WHERE session_id = ?
+        LIMIT 1
+    """, (session_id,))
+
+    exists = cursor.fetchone() is not None
+
+    if not exists:
+        conn.execute("""
+            INSERT INTO sessions (
+                session_id,
+                start_time,
+                src_ip,
+                protocol
+            )
+            VALUES (?, ?, ?, ?)
+        """, (
+            session_id,
+            event.get("timestamp"),
+            event.get("src_ip"),
+            event.get("protocol")
+        ))
+
+        conn.commit()
+
+        print(
+            f"[SESSION] {session_id} | {event.get('src_ip')}",
+            flush=True
+        )
+
+    conn.close()
+
+def insert_command(event):
+    """Insert a Cowrie command into the commands table."""
+
+    if event.get("eventid") != "cowrie.command.input":
+        return
+
+    message = event.get("message", "")
+
+    if not message.startswith("CMD:"):
+        return
+
+    command = message[4:].strip()
+
+    if not command:
+        return
+
+    conn = get_connection()
+
+    conn.execute("""
+        INSERT INTO commands (
+            session_id,
+            timestamp,
+            command,
+            category
+        )
+        VALUES (?, ?, ?, ?)
+    """, (
+        event.get("session"),
+        event.get("timestamp"),
+        command,
+        None
+    ))
+
+    conn.commit()
+    conn.close()
+
+    print(
+        f"[COMMAND] {event.get('session')} | {command}",
+        flush=True
+    )
 
 def process_line(line):
     """Process one Cowrie JSON event."""
@@ -121,6 +205,9 @@ def process_line(line):
                 f"| {event.get('message', '')}",
                 flush=True
             )
+
+        ensure_session(event)
+        insert_command(event)
 
     except json.JSONDecodeError:
         print("[!] Invalid JSON line", flush=True)
