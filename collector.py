@@ -164,7 +164,28 @@ def insert_command(event):
     if not command:
         return
 
+    session_id = event.get("session")
+    timestamp = event.get("timestamp")
+
     conn = get_connection()
+
+    cursor = conn.execute("""
+        SELECT 1
+        FROM commands
+        WHERE
+            session_id = ?
+            AND timestamp = ?
+            AND command = ?
+        LIMIT 1
+    """, (
+        session_id,
+        timestamp,
+        command
+    ))
+
+    if cursor.fetchone() is not None:
+        conn.close()
+        return
 
     conn.execute("""
         INSERT INTO commands (
@@ -175,8 +196,8 @@ def insert_command(event):
         )
         VALUES (?, ?, ?, ?)
     """, (
-        event.get("session"),
-        event.get("timestamp"),
+        session_id,
+        timestamp,
         command,
         None
     ))
@@ -185,9 +206,83 @@ def insert_command(event):
     conn.close()
 
     print(
-        f"[COMMAND] {event.get('session')} | {command}",
+        f"[COMMAND] {session_id} | {command}",
         flush=True
     )
+
+def update_session(event):
+    """Update structured session information from Cowrie events."""
+
+    session_id = event.get("session")
+
+    if not session_id:
+        return
+
+    event_id = event.get("eventid")
+
+    conn = get_connection()
+
+    if event_id == "cowrie.session.connect":
+        conn.execute("""
+            UPDATE sessions
+            SET
+                start_time = ?,
+                src_ip = ?,
+                protocol = ?
+            WHERE session_id = ?
+        """, (
+            event.get("timestamp"),
+            event.get("src_ip"),
+            event.get("protocol"),
+            session_id
+        ))
+
+    elif event_id == "cowrie.login.success":
+        message = event.get("message", "")
+
+        username = None
+        password = None
+
+        if "login attempt [" in message and "] succeeded" in message:
+            credentials = message.split("login attempt [", 1)[1]
+            credentials = credentials.split("] succeeded", 1)[0]
+
+            if "/" in credentials:
+                username, password = credentials.split("/", 1)
+
+        conn.execute("""
+            UPDATE sessions
+            SET
+                username = ?,
+                password = ?,
+                successful_login = 1
+            WHERE session_id = ?
+        """, (
+            username,
+            password,
+            session_id
+        ))
+
+    elif event_id == "cowrie.session.closed":
+        conn.execute("""
+            UPDATE sessions
+            SET
+                end_time = ?,
+                duration = CAST(
+                    (
+                        julianday(?) - julianday(start_time)
+                    ) * 86400
+                    AS INTEGER
+                )
+            WHERE session_id = ?
+        """, (
+            event.get("timestamp"),
+            event.get("timestamp"),
+            session_id
+        ))
+
+    conn.commit()
+    conn.close()
 
 def process_line(line):
     """Process one Cowrie JSON event."""
@@ -207,6 +302,7 @@ def process_line(line):
             )
 
         ensure_session(event)
+        update_session(event)
         insert_command(event)
 
     except json.JSONDecodeError:
