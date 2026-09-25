@@ -148,6 +148,159 @@ def ensure_session(event):
 
     conn.close()
 
+def classify_command(command):
+    """Classify a shell command into a security category."""
+
+    cmd = command.lower().strip()
+
+    # Get the base command, ignoring common path prefixes.
+    base = cmd.split()[0] if cmd else ""
+
+    if "/" in base:
+        base = base.rsplit("/", 1)[-1]
+
+    # ------------------------------------------------------------
+    # RECONNAISSANCE
+    # ------------------------------------------------------------
+
+    recon_commands = {
+        "whoami",
+        "id",
+        "uname",
+        "hostname",
+        "pwd",
+        "ls",
+        "ifconfig",
+        "netstat",
+        "ps",
+        "ss",
+        "traceroute",
+    }
+
+    if base in recon_commands:
+        return "recon"
+
+    if cmd.startswith("ip "):
+        return "recon"
+
+    if cmd == "cat /etc/os-release":
+        return "recon"
+
+    # ------------------------------------------------------------
+    # DOWNLOAD
+    # ------------------------------------------------------------
+
+    download_commands = {
+        "wget",
+        "curl",
+        "fetch",
+        "tftp",
+        "ftp",
+    }
+
+    if base in download_commands:
+        return "download"
+
+    # ------------------------------------------------------------
+    # EXECUTION
+    # ------------------------------------------------------------
+
+    execution_commands = {
+        "bash",
+        "sh",
+        "python",
+        "python3",
+        "perl",
+        "ruby",
+        "chmod",
+        "exec",
+        "mkdir",
+        "touch",
+    }
+
+    if base in execution_commands:
+        return "execution"
+
+    if base.startswith("."):
+        return "execution"
+
+    # ------------------------------------------------------------
+    # PERSISTENCE
+    # ------------------------------------------------------------
+
+    if base == "crontab":
+        return "persistence"
+
+    if "/etc/cron" in cmd:
+        return "persistence"
+
+    if "systemctl enable" in cmd:
+        return "persistence"
+
+    if "rc.local" in cmd:
+        return "persistence"
+
+    if ".ssh/authorized_keys" in cmd:
+        return "persistence"
+
+    # ------------------------------------------------------------
+    # CREDENTIAL ACCESS
+    # ------------------------------------------------------------
+
+    if "/etc/passwd" in cmd:
+        return "credential_access"
+
+    if "/etc/shadow" in cmd:
+        return "credential_access"
+
+    if "history" == base or base == "history":
+        return "credential_access"
+
+    if "ssh-key" in cmd:
+        return "credential_access"
+
+    if "authorized_keys" in cmd:
+        return "credential_access"
+
+    # ------------------------------------------------------------
+    # NETWORKING
+    # ------------------------------------------------------------
+
+    networking_commands = {
+        "nc",
+        "ncat",
+        "telnet",
+        "ping",
+        "nslookup",
+        "dig",
+    }
+
+    if base in networking_commands:
+        return "networking"
+
+    # ------------------------------------------------------------
+    # DESTRUCTIVE
+    # ------------------------------------------------------------
+
+    if base in {
+        "rm",
+        "rmdir",
+        "mkfs",
+    }:
+        return "destructive"
+
+    if base == "dd" and "if=" in cmd:
+        return "destructive"
+
+    if ":(){" in cmd:
+        return "destructive"
+
+    # ------------------------------------------------------------
+    # DEFAULT
+    # ------------------------------------------------------------
+
+    return "other"
+
 def insert_command(event):
     """Insert a Cowrie command into the commands table."""
 
@@ -164,6 +317,9 @@ def insert_command(event):
     if not command:
         return
 
+    category = classify_command(command)
+    generate_alert(event, command, category)
+    
     session_id = event.get("session")
     timestamp = event.get("timestamp")
 
@@ -199,7 +355,7 @@ def insert_command(event):
         session_id,
         timestamp,
         command,
-        None
+        category
     ))
 
     conn.commit()
@@ -207,6 +363,81 @@ def insert_command(event):
 
     print(
         f"[COMMAND] {session_id} | {command}",
+        flush=True
+    )
+
+def generate_alert(event, command, category):
+    """Generate a security alert from a classified command."""
+
+    severity_map = {
+        "credential_access": "high",
+        "download": "high",
+        "destructive": "high",
+        "persistence": "high",
+        "networking": "medium",
+        "recon": "low",
+    }
+
+    severity = severity_map.get(category)
+
+    if severity is None:
+        return
+
+    timestamp = event.get("timestamp")
+    src_ip = event.get("src_ip")
+    session_id = event.get("session")
+
+    description = f"Command detected: {command}"
+
+    conn = get_connection()
+
+    cursor = conn.execute("""
+        SELECT 1
+        FROM alerts
+        WHERE
+            timestamp = ?
+            AND alert_type = ?
+            AND src_ip = ?
+            AND session_id = ?
+            AND description = ?
+        LIMIT 1
+    """, (
+        timestamp,
+        category,
+        src_ip,
+        session_id,
+        description
+    ))
+
+    if cursor.fetchone() is not None:
+        conn.close()
+        return
+
+    conn.execute("""
+        INSERT INTO alerts (
+            timestamp,
+            alert_type,
+            severity,
+            src_ip,
+            session_id,
+            description
+        )
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        timestamp,
+        category,
+        severity,
+        src_ip,
+        session_id,
+        description
+    ))
+
+    conn.commit()
+    conn.close()
+
+    print(
+        f"[ALERT] {severity.upper()} | "
+        f"{category} | {src_ip} | {command}",
         flush=True
     )
 
